@@ -17,10 +17,10 @@ import Control.Arrow (second)
 import Data.List (unfoldr,mapAccumL)
 import Control.Lens hiding ((:<),(:>),(<|),(|>),viewl)
 import Control.Lens.TH (makeLenses)
-import System.Random (newStdGen,randomRs,randomRIO,Random)
+import System.Random (newStdGen,randomRs,randomRIO,Random, randoms)
 
 -- local
-import FingerTree (biSelectByMeasure, selectByMeasure, Min (..))
+import FingerTree (biSelectByMeasure, selectByMeasure, Min (..),swapHead)
 
 -- | Notion of time 
 type Time = Int
@@ -60,6 +60,9 @@ data Tram = Tram {
     tid :: TramId,
     _carrying :: People
     }
+    | Fresh {
+    tid :: TramId
+    }
     deriving Show
 makeLenses ''Tram
 
@@ -78,14 +81,16 @@ data Stop = Stop {
     name :: StopName, -- ^ stop name
     distance :: Time, -- ^ distance to the  next stop
     _waiting :: PeopleStore, -- ^ people at the stop
-    _events :: FingerTree (Min Time) Event -- ^ possible next event
+    _events :: FingerTree (Min Time) Event, -- ^ possible next event
+    _pool :: [TramId],
+    frequency :: Time
     }
 makeLenses ''Stop
 
 instance Measured (Min Time) Stop where
     measure = measure . view events
 --------------------------------------------------------------------------------
---------- cosuming events ------------------------------------------------------
+--------- consuming events ------------------------------------------------------
 --------------------------------------------------------------------------------
 
 data Log t 
@@ -134,7 +139,7 @@ consumeEvent cs s = let
     in case selectByMeasure es of
         (e@(Event ti tr), rf) -> do
             -- get the first of the queue
-            let h@(Event tif htr) :< _ = viewl es
+            let h@(Event tif htr) :< rs = viewl es
             case tid htr == tid tr of
                 -- if it's not the first in the queue , Just update the scheduling to the departure time of the first (+ something ?)
                 False -> do
@@ -142,12 +147,25 @@ consumeEvent cs s = let
                     return (set events (rf . Just $ Event tif tr) $ s, Nothing)
                 -- if it's the first check departing conditions
                 True -> do
-                    (w , t) <- movePeople cs (tid tr) (name s) ti (view waiting s) (view carrying tr)
-                    case t of
-                        -- if they are met leave the queue and transpose as arrival to the next stop
-                        Nothing -> return (set events (rf Nothing) $ s, Just $ over events (|> Event (ti + w + distance s) tr))
-                        -- if they are not met reschedule for loading more people
-                        Just (sp,tp) -> return (set waiting sp . set events (rf . Just $ Event (w + ti) (set carrying tp tr)) $ s, Nothing )
+                    case tr of
+                        Fresh ntid -> case null rs of
+                                -- some are arriving, drop departure
+                                False -> return (over events swapHead . set events (rf . Just $ Event (ti + frequency s) tr) $ s,Nothing)
+                                -- no trams arriving, enter the game
+                                True -> do
+                                    -- consume one name from the pool and make it a fresh tram
+                                    let (Event (ti + frequency s) . Fresh -> nt) : ps = view pool s
+                                    -- queue a real tram and a fresh tram
+                                    return (set pool ps . 
+                                            set events (fromList [Event ti (Tram ntid mempty),nt]) $ s,
+                                        Nothing)
+                        _ -> do
+                            (w , t) <- movePeople cs (tid tr) (name s) ti (view waiting s) (view carrying tr)
+                            case t of
+                                -- if they are met leave the queue and transpose as arrival to the next stop
+                                Nothing -> return (set events (rf Nothing) $ s, Just $ over events (|> Event (ti + w + distance s) tr))
+                                -- if they are not met reschedule for loading more people
+                                Just (sp,tp) -> return (set waiting sp . set events (rf . Just $ Event (w + ti) (set carrying tp tr)) $ s, Nothing )
 
 --  circle of stops  
 type Track = FingerTree (Min Time) Stop 
@@ -162,14 +180,15 @@ data StopConfig = StopConfig
     StopName -- stop name
     [Person] -- an infinite stream of person boarding
     Time -- distance int seconds to the next stop
-    [TramId] -- queue of departures trams, care! blocking the lane 
-    Time -- departure frequency of the queue
+    (Maybe ([TramId], Time)) -- queue of departures trams, care! blocking the lane 
 
 -- live stop
 mkStop :: StopConfig -> Stop
-mkStop (StopConfig name ps d tis dt) = Stop name d (mkPeopleStore ps) $ fromList $ unfoldr f (tis,1) where
-    f ([],t) = Nothing
-    f (n:ns,t) = Just (Event t (Tram n mempty),(ns,t + dt))
+mkStop (StopConfig name ps d mh) = let 
+        c = Stop name d (mkPeopleStore ps) 
+        in case mh of
+                Nothing -> c mempty [] (error "using a trams we don't have")
+                Just (ti:tis,dt) -> c (fromList [Event 0 (Fresh ti)]) tis dt where
 
 -- produce an infinite log from the simulation
 program     :: Controls  
@@ -177,44 +196,33 @@ program     :: Controls
             -> [Log Time] -- a stream of simulation states
 program cs = execWriter . let f s = step cs s >>= f in f . fromList . map mkStop 
 
-
 -- all times in seconds, variances
 data Params = Params {
-    peopleArrivalFreq :: (Time,Time), --
-    stopDistances :: (Time,Time),
-    departingInitiaDelays :: (Time,Time),
-    capacitiesOfTrams :: (Count,Count),
-    boardingPersonTimes :: (Time,Time),
-    numberOfStops :: (Int,Int),
-    numberOfTrams :: (Int,Int)
+    peopleDistr :: StopName -> Time -> (Time,Time),
+    stops :: [(StopName,Time)],
+    tramsCapacity :: Count,
+    boardingDelay :: Count -> Time,
+    trams :: (StopName,Time) -- Starting point, freq
     }
 
+peopleArrivals :: (Time -> (Time, Time)) -> IO [Time]
+peopleArrivals f = do
+    let g (t, r:rs) = Just (t',(t',rs)) where
+            t' = t + t0 + mod r (t1 - t0 + 1)
+            (t0,t1) = f t
+    unfoldr g <$> (,) 0 <$> randoms <$> newStdGen
 
-
-ranSim (Params paf sd did cot bpt nos not) = do
-    -- number of stops
-    ns <- randomRIO nos
-    -- stop names
-    let names = map StopName [1..ns]
-    -- number of trams
-    ntis <- randomRIO not
-    -- trams id and their starting stop
-    tsts <- forM [1..ntis] $ \ti -> (,) (TramId ti) <$> (names !!) <$> randomRIO (0,ns - 1)
-
-    ss <- forM names $ \name -> do
-            ps <- do
+createSim (Params pd ss tc bd (capo,fr)) = do
+    let names = map fst ss
+    sc <- forM ss $ \(sn,d) -> do
+        ps <- peopleArrivals (pd sn)
+        ns <- filter (/= sn) <$> map (names !!) <$> randomRs (0,length names - 1) <$> newStdGen
+        let mh = case sn == capo of
+                    False ->  Nothing
+                    True -> Just ([TramId x | x <- [1..]],fr)
+        return $ StopConfig sn (zip ps ns) d mh
+    return (Controls bd tc, sc)
                 
-                ts <- snd <$> mapAccumL (\a t -> (t + a,t + a)) 0 <$> randomRs paf <$> newStdGen
-                ns <- filter (/= name) <$> map (names !!) <$> randomRs (0,ns - 1) <$> newStdGen
-                return $ zip ts ns
-            d <- randomRIO sd
-            let tis = map fst . filter ((==) name . snd) $ tsts
-            t <- randomRIO did
-            return $ StopConfig name ps d tis t
-    friction <- (\t (Count c) -> t * c) <$> randomRIO bpt
-    cap <- randomRIO cot
-    return $ (Controls friction cap, ss)
-
 data Minutes = Minutes Int Int
 
 instance Show Minutes where
@@ -224,9 +232,15 @@ fromSeconds = uncurry Minutes . (`divMod` 60)
 
 toMinutes (Operating tis sn t cd ts) = Operating tis sn (fromSeconds t) cd (map fromSeconds ts) 
 toMinutes (Queued tis sn t) = Queued tis sn $ fromSeconds t
-toMinutes (Leaving tis sn t) = Queued tis sn $ fromSeconds t
--- example 
-p0 = Params (1,100) (60,300) (30,200) (100,200) (1,3) (5,15) (1,4)
+toMinutes (Leaving tis sn t) = Leaving tis sn $ fromSeconds t
 
-simulate p = uncurry program <$> ranSim p 
+
+simulate p = uncurry program <$> createSim p 
 printLogs n = mapM_ (print . toMinutes) . take n 
+
+-- example 
+
+p0 = Params (\_ _ -> (10,20)) [(StopName 1,200),(StopName 2, 50),(StopName 3,150),(StopName 4,100)] 10 (\_ -> 3) (StopName 1,60)
+p1 = Params (\_ _ -> (5,10)) [(StopName 1,200),(StopName 2, 200)] 30 (\_ -> 3) (StopName 1,60)
+    
+main = simulate p0 >>= printLogs 1000 

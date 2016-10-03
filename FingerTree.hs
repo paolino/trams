@@ -33,3 +33,4 @@ biSelectByMeasure t = let
             y :< bs' -> ((x,y), \(x,y) -> (y <| bs') <> (x <| cs))
             _ -> error "less than 2 elements"
 
+swapHead (viewl -> (x :< (viewl -> y :< rs))) = y <| x <| rs
